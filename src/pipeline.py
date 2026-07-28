@@ -15,9 +15,23 @@ from src.vocab import VocabIndex
 
 
 class LLM(Protocol):
-    def encode(self, text: str) -> list[int]: ...
+    def encode(self, text: str) -> Any: ...
 
     def get_logits_from_input_ids(self, input_ids: list[int]) -> list[float]: ...
+
+
+def _encode_ids(sdk: LLM, text: str) -> list[int]:
+    """Normalise ``sdk.encode`` output to a flat list[int].
+
+    The real llm_sdk returns a 2-D torch tensor (shape [1, seq_len]); some
+    stubs/tests may pass a plain list instead. Handle both.
+    """
+    encoded = sdk.encode(text)
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return [int(x) for x in encoded]
 
 
 def _build_selection_prompt(prompt: str, functions: list[FunctionDefinition]) -> str:
@@ -51,7 +65,7 @@ def select_function(
 ) -> FunctionDefinition:
     """Ask the LLM to pick a function name, restricted to the known names."""
     text = _build_selection_prompt(prompt, functions)
-    ids = sdk.encode(text)
+    ids = _encode_ids(sdk, text)
     names = [fn.name for fn in functions]
     chosen_name = constrained_choice_decode(sdk, vocab_index, ids, names)
     by_name = {fn.name: fn for fn in functions}
@@ -65,7 +79,7 @@ def generate_arguments(
     args: dict[str, Any] = {}
     for param_name, spec in fn.parameters.items():
         text = _build_argument_prompt(prompt, fn, args)
-        ids = sdk.encode(text)
+        ids = _encode_ids(sdk, text)
         if spec.type == "number":
             raw = constrained_number_decode(sdk, vocab_index, ids)
             args[param_name] = float(raw)
