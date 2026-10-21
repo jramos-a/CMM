@@ -1,112 +1,102 @@
-# ABOUTME: Builds and caches the token-id <-> token-string index used to
-# ABOUTME: restrict candidate tokens during constrained decoding.
+"""Pre-computed views of the vocabulary used by the constrained decoder."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Protocol
+import codecs
+
+import numpy as np
+from pydantic import BaseModel, ConfigDict
+
+from src.tokenizer import BPETokenizer
+
+REPLACEMENT_CHAR = "�"
 
 
-class DecodesTokens(Protocol):
-    """Structural type for the subset of the SDK we depend on here."""
+def utf8_feed(data: bytes) -> tuple[str, bytes]:
+    """Decode the complete characters of ``data``.
 
-    def decode(self, ids: list[int]) -> str: ...
+    Returns:
+        The decoded text and the trailing bytes of an unfinished
+        character.
 
-    def get_path_to_tokenizer_file(self) -> str: ...
+    Raises:
+        UnicodeDecodeError: If ``data`` is not a valid UTF-8 prefix.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    text = decoder.decode(data, final=False)
+    return text, decoder.getstate()[0]
 
 
-@dataclass
-class TrieNode:
-    """A single node of the token-string prefix trie.
+class TokenTable(BaseModel):
+    """Token id -> text map plus indexes that make masking fast.
 
-    ``token_ids`` holds every vocabulary token whose decoded string equals the
-    path from the root to this node (usually 0 or 1, occasionally more for
-    tokenizers with duplicate pieces).
+    Attributes:
+        texts: Decoded text of every id, ``None`` for special tokens and
+            for tokens that are not valid UTF-8 on their own.
+        first_char_index: First character -> ids of tokens starting with it.
+        plain_string_ids: Tokens that are always valid inside a JSON
+            string (no quote, no backslash, no control character).
+        string_special_ids: Tokens with a quote or a backslash; they need
+            to be checked against the automaton one by one.
+        partial_ids: Tokens holding a fragment of a multi-byte character
+            (only usable inside strings, combined with their neighbours).
+        partial_bytes: Raw bytes of each ``partial_ids`` token.
     """
 
-    children: dict[str, "TrieNode"] = field(default_factory=dict)
-    token_ids: list[int] = field(default_factory=list)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    texts: list[str | None]
+    first_char_index: dict[str, list[int]]
+    plain_string_ids: np.ndarray
+    string_special_ids: list[int]
+    partial_ids: list[int]
+    partial_bytes: list[bytes]
 
-class VocabIndex:
-    """Maps token ids to their decoded string form and exposes a prefix trie
-    so that, given a partial output string, we can cheaply enumerate which
-    vocabulary tokens are legal continuations."""
-
-    def __init__(self, id_to_str: dict[int, str]) -> None:
-        self.id_to_str = id_to_str
-        self.root = TrieNode()
-        for token_id, text in id_to_str.items():
-            if text == "":
+    @classmethod
+    def build(cls, tokenizer: BPETokenizer) -> TokenTable:
+        """Decode every token once and build the indexes."""
+        texts: list[str | None] = []
+        index: dict[str, list[int]] = {}
+        plain: list[int] = []
+        special: list[int] = []
+        partial: list[int] = []
+        partial_raw: list[bytes] = []
+        for token_id in range(tokenizer.vocab_size):
+            raw = None if tokenizer.is_special(token_id) \
+                else tokenizer.token_bytes(token_id)
+            text: str | None = None
+            if raw:
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    partial.append(token_id)
+                    partial_raw.append(raw)
+            if text is not None and REPLACEMENT_CHAR in text:
+                text = None
+            texts.append(text)
+            if text is None:
                 continue
-            node = self.root
-            for char in text:
-                node = node.children.setdefault(char, TrieNode())
-            node.token_ids.append(token_id)
+            index.setdefault(text[0], []).append(token_id)
+            if '"' in text or "\\" in text:
+                special.append(token_id)
+            elif all(ord(c) >= 0x20 for c in text):
+                plain.append(token_id)
+        return cls(
+            texts=texts,
+            first_char_index=index,
+            plain_string_ids=np.asarray(plain, dtype=np.int64),
+            string_special_ids=special,
+            partial_ids=partial,
+            partial_bytes=partial_raw,
+        )
 
-    def candidates_for_prefix_budget(self, allowed_prefix: str) -> list[tuple[int, str]]:
-        """Return every (token_id, token_str) whose decoded string is a
-        non-empty prefix-match walk starting at the trie root that stays
-        inside ``allowed_prefix`` (i.e. the token string is itself a prefix
-        of ``allowed_prefix``, possibly equal to it)."""
-        results: list[tuple[int, str]] = []
-        node = self.root
-        text_so_far = ""
-        for char in allowed_prefix:
-            if char not in node.children:
-                break
-            node = node.children[char]
-            text_so_far += char
-            for token_id in node.token_ids:
-                results.append((token_id, text_so_far))
-        return results
+    def ids_starting_with(self, chars: set[str]) -> list[int]:
+        """Return the ids of all tokens whose first character is in chars."""
+        out: list[int] = []
+        for char in chars:
+            out.extend(self.first_char_index.get(char, ()))
+        return out
 
-
-def _cache_path(model_name: str) -> Path:
-    safe_name = model_name.replace("/", "__")
-    cache_dir = Path.home() / ".cache" / "function_calling_vocab"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{safe_name}.json"
-
-
-def build_vocab_index(sdk: DecodesTokens, model_name: str, vocab_size: int) -> VocabIndex:
-    """Build (or load from disk cache) the id->string map for the model.
-
-    We rely purely on ``sdk.decode`` (a public, non-underscored method) so we
-    never touch any private llm_sdk internals, per the project rules.
-    """
-    cache_file = _cache_path(model_name)
-    if cache_file.is_file():
-        try:
-            raw = json.loads(cache_file.read_text(encoding="utf-8"))
-            if raw.get("vocab_size") == vocab_size:
-                id_to_str = {int(k): v for k, v in raw["id_to_str"].items()}
-                return VocabIndex(id_to_str)
-        except (json.JSONDecodeError, KeyError, ValueError):
-            pass  # fall through and rebuild
-
-    built_id_to_str: dict[int, str] = {}
-    for token_id in range(vocab_size):
-        try:
-            built_id_to_str[token_id] = sdk.decode([token_id])
-        except Exception:  # noqa: BLE001 - a handful of ids may be invalid
-            continue
-
-    cache_file.write_text(
-        json.dumps({"vocab_size": vocab_size, "id_to_str": built_id_to_str}),
-        encoding="utf-8",
-    )
-    return VocabIndex(built_id_to_str)
-
-
-def vocab_size_from_tokenizer_file(sdk: DecodesTokens) -> int:
-    """Read vocab size out of tokenizer.json without touching private attrs."""
-    tokenizer_path = Path(sdk.get_path_to_tokenizer_file())
-    data = json.loads(tokenizer_path.read_text(encoding="utf-8"))
-    vocab = data.get("model", {}).get("vocab", {})
-    size = (max(vocab.values()) + 1) if vocab else 0
-    for added in data.get("added_tokens", []):
-        size = max(size, added.get("id", 0) + 1)
-    return size
+    def all_ids(self) -> list[int]:
+        """Return every id that has a usable text."""
+        return [i for i, text in enumerate(self.texts) if text is not None]

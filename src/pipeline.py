@@ -1,102 +1,115 @@
-# ABOUTME: Wires prompt construction and constrained decoding together to
-# ABOUTME: turn a natural-language prompt into a validated function call.
+"""Turns one natural-language prompt into a validated function call."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+import json
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 from src.constrained_decoder import (
-    constrained_choice_decode,
-    constrained_number_decode,
-    constrained_string_decode,
+    ConstrainedDecoder,
+    DecodeResult,
+    DecodingConfig,
 )
-from src.schema import FunctionCallResult, FunctionDefinition
-from src.vocab import VocabIndex
+from src.grammar import initial_state
+from src.llm import LLMClient
+from src.prompting import build_argument_prompt, build_selection_prompt
+from src.schema import FunctionCallResult, FunctionDefinition, ParameterSpec
+from src.vocab import TokenTable
 
 
-class LLM(Protocol):
-    def encode(self, text: str) -> Any: ...
+def coerce_value(value: Any, spec: ParameterSpec) -> Any:
+    """Convert a decoded JSON value to the Python type of its spec.
 
-    def get_logits_from_input_ids(self, input_ids: list[int]) -> list[float]: ...
-
-
-def _encode_ids(sdk: LLM, text: str) -> list[int]:
-    """Normalise ``sdk.encode`` output to a flat list[int].
-
-    The real llm_sdk returns a 2-D torch tensor (shape [1, seq_len]); some
-    stubs/tests may pass a plain list instead. Handle both.
+    ``number`` values are always returned as ``float`` (``2`` -> ``2.0``)
+    and ``integer`` values as ``int``; containers are converted
+    recursively.
     """
-    encoded = sdk.encode(text)
-    if hasattr(encoded, "tolist"):
-        encoded = encoded.tolist()
-    if encoded and isinstance(encoded[0], list):
-        encoded = encoded[0]
-    return [int(x) for x in encoded]
+    if spec.type == "number" and not isinstance(value, bool):
+        return float(value)
+    if spec.type == "integer" and not isinstance(value, bool):
+        return int(value)
+    if spec.type == "array" and spec.items is not None:
+        return [coerce_value(v, spec.items) for v in value]
+    if spec.type == "object" and spec.properties:
+        return {k: coerce_value(value[k], s)
+                for k, s in spec.properties.items()}
+    return value
 
 
-def _build_selection_prompt(prompt: str, functions: list[FunctionDefinition]) -> str:
-    lines = [
-        "You are a function-calling assistant. Choose exactly one function "
-        "that answers the user's request.",
-        "Available functions:",
-    ]
-    for fn in functions:
-        params = ", ".join(f"{name}: {spec.type}" for name, spec in fn.parameters.items())
-        lines.append(f"- {fn.name}({params}): {fn.description}")
-    lines.append(f'User request: "{prompt}"')
-    lines.append("Function name: ")
-    return "\n".join(lines)
+class CallOutcome(BaseModel):
+    """A processed prompt with its decoding details."""
+
+    result: FunctionCallResult
+    decode: DecodeResult
 
 
-def _build_argument_prompt(
-    prompt: str, fn: FunctionDefinition, filled: dict[str, Any]
-) -> str:
-    filled_desc = ", ".join(f'"{k}": {v!r}' for k, v in filled.items()) or "(none yet)"
-    return (
-        f'User request: "{prompt}"\n'
-        f"Chosen function: {fn.name}\n"
-        f"Arguments filled so far: {filled_desc}\n"
-        f"Next argument value: "
-    )
+class FunctionCaller(BaseModel):
+    """Selects a function and its arguments for each prompt.
 
+    Attributes:
+        decoder: Constrained decoder bound to the model.
+        functions: Available functions.
+    """
 
-def select_function(
-    sdk: LLM, vocab_index: VocabIndex, prompt: str, functions: list[FunctionDefinition]
-) -> FunctionDefinition:
-    """Ask the LLM to pick a function name, restricted to the known names."""
-    text = _build_selection_prompt(prompt, functions)
-    ids = _encode_ids(sdk, text)
-    names = [fn.name for fn in functions]
-    chosen_name = constrained_choice_decode(sdk, vocab_index, ids, names)
-    by_name = {fn.name: fn for fn in functions}
-    return by_name[chosen_name]
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    decoder: ConstrainedDecoder
+    functions: list[FunctionDefinition]
 
-def generate_arguments(
-    sdk: LLM, vocab_index: VocabIndex, prompt: str, fn: FunctionDefinition
-) -> dict[str, Any]:
-    """Fill every declared parameter of ``fn`` with a constrained-decoded value."""
-    args: dict[str, Any] = {}
-    for param_name, spec in fn.parameters.items():
-        text = _build_argument_prompt(prompt, fn, args)
-        ids = _encode_ids(sdk, text)
-        if spec.type == "number":
-            raw = constrained_number_decode(sdk, vocab_index, ids)
-            args[param_name] = float(raw)
-        elif spec.type == "boolean":
-            raw_bool = constrained_choice_decode(sdk, vocab_index, ids, ["true", "false"])
-            args[param_name] = raw_bool == "true"
-        else:  # "string"
-            args[param_name] = constrained_string_decode(sdk, vocab_index, ids)
-    return args
+    @classmethod
+    def create(
+        cls,
+        llm: LLMClient,
+        functions: list[FunctionDefinition],
+        config: DecodingConfig | None = None,
+    ) -> FunctionCaller:
+        """Build the tokenizer, vocabulary indexes and decoder for ``llm``.
 
+        Raises:
+            LLMError: If the tokenizer files cannot be loaded.
+        """
+        tokenizer = llm.load_tokenizer()
+        decoder = ConstrainedDecoder(
+            llm=llm, tokenizer=tokenizer, table=TokenTable.build(tokenizer),
+            config=config or DecodingConfig())
+        return cls(decoder=decoder, functions=functions)
 
-def process_prompt(
-    sdk: LLM,
-    vocab_index: VocabIndex,
-    prompt: str,
-    functions: list[FunctionDefinition],
-) -> FunctionCallResult:
-    fn = select_function(sdk, vocab_index, prompt, functions)
-    args = generate_arguments(sdk, vocab_index, prompt, fn)
-    return FunctionCallResult(prompt=prompt, fn_name=fn.name, args=args)
+    def _template_flags(self) -> tuple[bool, bool]:
+        """Return (use ChatML, add empty think block) for this model."""
+        special = self.decoder.tokenizer.special_tokens
+        return "<|im_start|>" in special, "<think>" in special
+
+    def selection_ids(self, request: str) -> list[int]:
+        """Encode the function selection prompt for ``request``."""
+        chat, thinking = self._template_flags()
+        return self.decoder.tokenizer.encode(
+            build_selection_prompt(request, self.functions, chat, thinking))
+
+    def argument_ids(self, request: str, generated: str) -> list[int]:
+        """Encode the argument prompt once the name is in ``generated``."""
+        for fn in self.functions:
+            if generated.startswith(f'{{"name": {json.dumps(fn.name)},'):
+                chat, thinking = self._template_flags()
+                return self.decoder.tokenizer.encode(
+                    build_argument_prompt(request, fn, chat, thinking))
+        return self.selection_ids(request)
+
+    def call(self, request: str) -> CallOutcome:
+        """Process one prompt.
+
+        The function name and every argument are generated by the model
+        under the grammar, so the decoded text is always valid JSON that
+        matches the selected function's schema.
+        """
+        decoded = self.decoder.generate(
+            self.selection_ids(request), initial_state(self.functions),
+            reprompt=lambda generated: self.argument_ids(request, generated))
+        data = json.loads(decoded.text)
+        by_name = {fn.name: fn for fn in self.functions}
+        fn = by_name[data["name"]]
+        params = coerce_value(data["parameters"], fn.as_object_spec())
+        result = FunctionCallResult(
+            prompt=request, name=fn.name, parameters=params)
+        return CallOutcome(result=result, decode=decoded)
