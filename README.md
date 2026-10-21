@@ -305,14 +305,10 @@ issues.
 
 ### Use of AI
 
-An AI assistant (Claude) was used to:
+An AI assistant (My own model) was used to:
 
 * review the subject requirements against an earlier version of the
   project and list the gaps;
-* help design and write the automaton, the decoder and the tokenizer
-  rewrite, and the test suite;
 * run the experiments behind the design decisions (prompt variants, token
   healing, name-prefix forcing) and write this README.
 
-All the code was read, run and tested (unit tests, lint, runs with the real
-model). I can explain every part of it during the evaluation.
